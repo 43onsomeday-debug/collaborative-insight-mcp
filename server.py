@@ -1,15 +1,18 @@
 """
 Collaborative Insight Generation Framework - MCP Server (Updated)
-- Phase 3 대화형 처리 수정: 질문을 하나씩, 답변을 기다림
+- Phase 1.5 추가: 환경 체크
+- 전역 타임아웃: 30분
+- Phase 2, 4: 단독/다중 모드 지원
 """
 from fastmcp import FastMCP
 from datetime import datetime
 from typing import Optional
 import json
 
-from models import WorkflowState, RequestType
+from models import WorkflowState, RequestType, Phase1_5Result
 from phases.phase0 import RequestAnalyzer
 from phases.phase1 import ExpertAssigner
+from phases.phase1_5 import EnvironmentChecker
 from phases.phase2 import InformationGatherer
 from phases.phase3 import Clarifier
 from phases.phase4 import DesignGenerator
@@ -25,6 +28,23 @@ llm_client = LLMClient()
 
 # 세션 저장소 (실제 환경에서는 DB 사용)
 sessions = {}
+
+
+def check_timeout(session_id: str) -> dict | None:
+    """타임아웃 체크 (전역 30분)"""
+    if session_id not in sessions:
+        return {"error": "Session not found"}
+    
+    workflow = sessions[session_id]
+    if workflow.is_timeout():
+        return {
+            "error": "Session timeout",
+            "message": f"세션이 {workflow.timeout_minutes}분을 초과했습니다.",
+            "elapsed_minutes": (datetime.now() - workflow.started_at).total_seconds() / 60,
+            "session_id": session_id
+        }
+    
+    return None
 
 
 # ============================================================================
@@ -69,12 +89,235 @@ def analyze_request(
         "complexity_score": result.complexity_score.total_score if result.complexity_score else None,
         "confidence": result.confidence,
         "reasoning": result.reasoning,
-        "next_phase": "clarify_user_intent" if result.clarity_score.total_score < 4 else "assign_experts"
+        "next_phase": "assign_experts",
+        "timeout_minutes": 30
     }
 
 
 # ============================================================================
-# Tool 4: clarify_user_intent - Phase 3 (수정됨 - 대화형)
+# Tool 2: assign_experts - Phase 1
+# ============================================================================
+
+@mcp.tool()
+def assign_experts(session_id: str) -> dict:
+    """
+    계층 구조를 파악하고 전문가를 배정합니다 (Phase 1).
+    
+    Args:
+        session_id: 세션 ID
+    
+    Returns:
+        전문가 배정 결과
+    """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
+    if session_id not in sessions:
+        return {"error": "Session not found"}
+    
+    workflow = sessions[session_id]
+    
+    if not workflow.phase0_result:
+        return {"error": "Phase 0 not completed"}
+    
+    # Phase 3가 필요했지만 완료되지 않았다면 경고
+    if hasattr(workflow, 'waiting_for_answer') and workflow.waiting_for_answer:
+        return {
+            "error": "Clarification questions are still pending",
+            "message": "명확화 질문에 먼저 답변해주세요",
+            "current_question_index": workflow.current_question_index,
+            "next_action": "clarify_user_intent"
+        }
+    
+    # Phase 1 실행
+    complexity = workflow.phase0_result.complexity_score.total_score if workflow.phase0_result.complexity_score else 0
+    
+    result = ExpertAssigner.assign(
+        workflow.user_request,
+        complexity_score=complexity
+    )
+    
+    workflow.phase1_result = result
+    workflow.current_phase = 1
+    workflow.update_timestamp()
+    
+    return {
+        "session_id": session_id,
+        "hierarchy": {
+            "domain": result.hierarchy.domain,
+            "subdomain": result.hierarchy.subdomain,
+            "category": result.hierarchy.category,
+            "task": result.hierarchy.task
+        },
+        "experts": [
+            {
+                "name": expert.name,
+                "expertise": expert.expertise,
+                "layers": [layer.value for layer in expert.layers]
+            }
+            for expert in result.experts
+        ],
+        "processing_mode": result.processing_mode.value,
+        "next_phase": "check_environment"
+    }
+
+
+# ============================================================================
+# Tool 2.5: check_environment - Phase 1.5 (NEW)
+# ============================================================================
+
+@mcp.tool()
+def check_environment(session_id: str) -> dict:
+    """
+    환경을 체크합니다 (Phase 1.5).
+    - Zen MCP 연결 확인
+    - LLM API 개수 확인
+    - Phase 2, 4 실행 모드 결정
+    - 예상 비용 표시
+    
+    Args:
+        session_id: 세션 ID
+    
+    Returns:
+        환경 체크 결과
+    """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
+    if session_id not in sessions:
+        return {"error": "Session not found"}
+    
+    workflow = sessions[session_id]
+    
+    if not workflow.phase1_result:
+        return {"error": "Phase 1 not completed"}
+    
+    # Phase 1.5 실행
+    result = EnvironmentChecker.check_environment(session_id)
+    
+    # Phase1_5Result 모델로 변환
+    phase1_5_result = Phase1_5Result(**result)
+    workflow.phase1_5_result = phase1_5_result
+    workflow.current_phase = 1.5
+    workflow.update_timestamp()
+    
+    # 다음 Phase 결정
+    request_type = workflow.phase0_result.request_type if workflow.phase0_result else RequestType.TYPE_2
+    
+    if request_type == RequestType.TYPE_3:
+        next_phase = "clarify_user_intent"
+    else:
+        next_phase = "gather_information"
+    
+    return {
+        "session_id": session_id,
+        "zen_mcp_status": {
+            "connected": result["zen_mcp_connected"],
+            "message": result["zen_mcp_message"]
+        },
+        "api_info": {
+            "count": result["api_count"],
+            "available": result["available_apis"]
+        },
+        "execution_mode": result["execution_mode"],
+        "estimated_costs": result["estimated_costs"],
+        "cache_info": {
+            "enabled": result["cache_enabled"],
+            "ttl_minutes": result["cache_ttl_minutes"]
+        },
+        "next_phase": next_phase,
+        "message": "✅ 환경 체크 완료"
+    }
+
+
+# ============================================================================
+# Tool 3: gather_information - Phase 2
+# ============================================================================
+
+@mcp.tool()
+async def gather_information(session_id: str) -> dict:
+    """
+    전략적 정보를 수집합니다 (Phase 2).
+    - 단독 모드: API 0개일 때 (Zen MCP Fallback)
+    - 다중 모드: API 1~4개일 때
+    
+    Args:
+        session_id: 세션 ID
+    
+    Returns:
+        수집된 정보 결과
+    """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
+    if session_id not in sessions:
+        return {"error": "Session not found"}
+    
+    workflow = sessions[session_id]
+    
+    if not workflow.phase1_result:
+        return {"error": "Phase 1 not completed"}
+    
+    # Phase 1.5 결과로 실행 모드 결정
+    execution_mode = "단독"
+    llms_used = []
+    
+    if workflow.phase1_5_result:
+        execution_mode = workflow.phase1_5_result.execution_mode.get("phase2", "단독")
+        llms_used = workflow.phase1_5_result.available_apis
+    
+    # Phase 2 실행
+    expert_names = [expert.name for expert in workflow.phase1_result.experts]
+    
+    result = await InformationGatherer.gather_information(
+        user_request=workflow.user_request,
+        experts=expert_names,
+        context={"phase1": workflow.phase1_result.model_dump()}
+    )
+    
+    # execution_mode 추가
+    result.execution_mode = execution_mode
+    result.llms_used = llms_used
+    
+    workflow.phase2_result = result
+    workflow.current_phase = 2
+    workflow.update_timestamp()
+    
+    return {
+        "session_id": session_id,
+        "execution_mode": execution_mode,
+        "llms_used": llms_used,
+        "research_items_count": len(result.research_items),
+        "research_items": [
+            {
+                "query": item.query,
+                "category": item.category,
+                "priority": item.priority
+            }
+            for item in result.research_items[:10]
+        ],
+        "sources_count": len(result.sources),
+        "sources": [
+            {
+                "title": source.title,
+                "url": source.url,
+                "relevance_score": source.relevance_score
+            }
+            for source in result.sources[:5]
+        ],
+        "next_phase": "create_design",
+        "message": f"✅ 정보 수집 완료 ({execution_mode} 모드)"
+    }
+
+
+# ============================================================================
+# Tool 4: clarify_user_intent - Phase 3
 # ============================================================================
 
 @mcp.tool()
@@ -91,6 +334,11 @@ def clarify_user_intent(
     Returns:
         현재 질문 (하나만) 및 대기 상태
     """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
     if session_id not in sessions:
         return {"error": "Session not found"}
     
@@ -138,7 +386,7 @@ def clarify_user_intent(
             "message": "모든 명확화 질문이 완료되었습니다",
             "total_questions": len(workflow.all_questions),
             "answered": len(workflow.collected_answers),
-            "next_phase": "assign_experts"
+            "next_phase": "재분류 필요 (analyze_request 다시 호출)"
         }
     
     # 현재 질문 하나만 반환
@@ -160,7 +408,7 @@ def clarify_user_intent(
 
 
 # ============================================================================
-# Tool 4-1: answer_clarification_question - 답변 받기 (새로 추가)
+# Tool 4-1: answer_clarification_question - 답변 받기
 # ============================================================================
 
 @mcp.tool()
@@ -178,6 +426,11 @@ def answer_clarification_question(
     Returns:
         다음 질문 또는 완료 상태
     """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
     if session_id not in sessions:
         return {"error": "Session not found"}
     
@@ -226,10 +479,10 @@ def answer_clarification_question(
         return {
             "session_id": session_id,
             "status": "completed",
-            "message": "모든 명확화 질문이 완료되었습니다!",
+            "message": "모든 명확화 질문이 완료되었습니다! 이제 analyze_request를 다시 호출하여 재분류하세요.",
             "total_questions": len(workflow.all_questions),
             "answered": len(workflow.collected_answers),
-            "next_phase": "assign_experts",
+            "next_phase": "재분류 (analyze_request)",
             "your_answer": answer
         }
     
@@ -252,134 +505,6 @@ def answer_clarification_question(
 
 
 # ============================================================================
-# Tool 2: assign_experts - Phase 1
-# ============================================================================
-
-@mcp.tool()
-def assign_experts(session_id: str) -> dict:
-    """
-    계층 구조를 파악하고 전문가를 배정합니다 (Phase 1).
-    
-    Args:
-        session_id: 세션 ID
-    
-    Returns:
-        전문가 배정 결과
-    """
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-    
-    workflow = sessions[session_id]
-    
-    if not workflow.phase0_result:
-        return {"error": "Phase 0 not completed"}
-    
-    # Phase 3가 필요했지만 완료되지 않았다면 경고
-    if hasattr(workflow, 'waiting_for_answer') and workflow.waiting_for_answer:
-        return {
-            "error": "Clarification questions are still pending",
-            "message": "명확화 질문에 먼저 답변해주세요",
-            "current_question_index": workflow.current_question_index,
-            "next_action": "clarify_user_intent"
-        }
-    
-    # Phase 1 실행
-    complexity = workflow.phase0_result.complexity_score.total_score if workflow.phase0_result.complexity_score else 0
-    
-    result = ExpertAssigner.assign(
-        workflow.user_request,
-        complexity_score=complexity
-    )
-    
-    workflow.phase1_result = result
-    workflow.current_phase = 1
-    workflow.update_timestamp()
-    
-    return {
-        "session_id": session_id,
-        "hierarchy": {
-            "domain": result.hierarchy.domain,
-            "subdomain": result.hierarchy.subdomain,
-            "category": result.hierarchy.category,
-            "task": result.hierarchy.task
-        },
-        "experts": [
-            {
-                "name": expert.name,
-                "expertise": expert.expertise,
-                "layers": [layer.value for layer in expert.layers]
-            }
-            for expert in result.experts
-        ],
-        "processing_mode": result.processing_mode.value,
-        "next_phase": "gather_information"
-    }
-
-
-# 나머지 도구들은 원본과 동일...
-# (gather_information, create_design, select_llm, execute_task, get_workflow_status 등)
-
-# ============================================================================
-# Tool 3: gather_information - Phase 2
-# ============================================================================
-
-@mcp.tool()
-async def gather_information(session_id: str) -> dict:
-    """
-    전략적 정보를 수집합니다 (Phase 2).
-    
-    Args:
-        session_id: 세션 ID
-    
-    Returns:
-        수집된 정보 결과
-    """
-    if session_id not in sessions:
-        return {"error": "Session not found"}
-    
-    workflow = sessions[session_id]
-    
-    if not workflow.phase1_result:
-        return {"error": "Phase 1 not completed"}
-    
-    # Phase 2 실행
-    expert_names = [expert.name for expert in workflow.phase1_result.experts]
-    
-    result = await InformationGatherer.gather_information(
-        user_request=workflow.user_request,
-        experts=expert_names,
-        context={"phase1": workflow.phase1_result.model_dump()}
-    )
-    
-    workflow.phase2_result = result
-    workflow.current_phase = 2
-    workflow.update_timestamp()
-    
-    return {
-        "session_id": session_id,
-        "research_items_count": len(result.research_items),
-        "research_items": [
-            {
-                "query": item.query,
-                "category": item.category,
-                "priority": item.priority
-            }
-            for item in result.research_items[:10]
-        ],
-        "sources_count": len(result.sources),
-        "sources": [
-            {
-                "title": source.title,
-                "url": source.url,
-                "relevance_score": source.relevance_score
-            }
-            for source in result.sources[:5]
-        ],
-        "next_phase": "create_design"
-    }
-
-
-# ============================================================================
 # Tool 5: create_design - Phase 4
 # ============================================================================
 
@@ -387,6 +512,8 @@ async def gather_information(session_id: str) -> dict:
 async def create_design(session_id: str) -> dict:
     """
     설계서를 생성합니다 (Phase 4).
+    - 단독 모드: API 0개일 때
+    - 다중 모드: API 1~4개일 때 (섹션별 협의)
     
     Args:
         session_id: 세션 ID
@@ -394,6 +521,11 @@ async def create_design(session_id: str) -> dict:
     Returns:
         생성된 설계서
     """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
     if session_id not in sessions:
         return {"error": "Session not found"}
     
@@ -401,6 +533,12 @@ async def create_design(session_id: str) -> dict:
     
     if not workflow.phase0_result or not workflow.phase1_result:
         return {"error": "Previous phases not completed"}
+    
+    # Phase 1.5 결과로 실행 모드 결정
+    execution_mode = "단독"
+    
+    if workflow.phase1_5_result:
+        execution_mode = workflow.phase1_5_result.execution_mode.get("phase4", "단독")
     
     # Phase 4 실행
     result = await DesignGenerator.create_design(
@@ -410,6 +548,9 @@ async def create_design(session_id: str) -> dict:
         llm_client=llm_client
     )
     
+    # execution_mode 추가
+    result.execution_mode = execution_mode
+    
     workflow.phase4_result = result
     workflow.current_phase = 4
     workflow.update_timestamp()
@@ -418,6 +559,7 @@ async def create_design(session_id: str) -> dict:
     
     return {
         "session_id": session_id,
+        "execution_mode": execution_mode,
         "title": design_doc.title,
         "quality_level": design_doc.quality_level.value,
         "sections": [
@@ -428,7 +570,8 @@ async def create_design(session_id: str) -> dict:
             for section in design_doc.sections
         ],
         "references_count": len(design_doc.references),
-        "next_phase": "select_llm"
+        "next_phase": "select_llm",
+        "message": f"✅ 설계서 생성 완료 ({execution_mode} 모드)"
     }
 
 
@@ -449,6 +592,11 @@ def select_llm(
     Returns:
         선정된 LLM 정보
     """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
     if session_id not in sessions:
         return {"error": "Session not found"}
     
@@ -509,6 +657,11 @@ async def execute_task(
     Returns:
         실행 결과
     """
+    # 타임아웃 체크
+    timeout_result = check_timeout(session_id)
+    if timeout_result:
+        return timeout_result
+    
     if session_id not in sessions:
         return {"error": "Session not found"}
     
@@ -547,7 +700,8 @@ async def execute_task(
     return {
         "session_id": session_id,
         "result": result,
-        "llm_used": selected_llm
+        "llm_used": selected_llm,
+        "next_phase": "완료 또는 quality_check (Phase 7)"
     }
 
 
@@ -571,15 +725,25 @@ def get_workflow_status(session_id: str) -> dict:
     
     workflow = sessions[session_id]
     
+    # 타임아웃 체크
+    is_timeout = workflow.is_timeout()
+    elapsed_minutes = (datetime.now() - workflow.started_at).total_seconds() / 60
+    
     status = {
         "session_id": session_id,
         "current_phase": workflow.current_phase,
         "user_request": workflow.user_request,
         "request_type": workflow.phase0_result.request_type.value if workflow.phase0_result else None,
         "processing_mode": workflow.phase1_result.processing_mode.value if workflow.phase1_result else None,
+        "timeout_status": {
+            "is_timeout": is_timeout,
+            "elapsed_minutes": round(elapsed_minutes, 2),
+            "timeout_limit_minutes": workflow.timeout_minutes
+        },
         "phases_completed": {
             "phase0": workflow.phase0_result is not None,
             "phase1": workflow.phase1_result is not None,
+            "phase1_5": workflow.phase1_5_result is not None,
             "phase2": workflow.phase2_result is not None,
             "phase3": workflow.phase3_result is not None,
             "phase4": workflow.phase4_result is not None,
@@ -589,6 +753,14 @@ def get_workflow_status(session_id: str) -> dict:
         "created_at": workflow.created_at.isoformat(),
         "updated_at": workflow.updated_at.isoformat()
     }
+    
+    # Phase 1.5 정보 추가
+    if workflow.phase1_5_result:
+        status["environment"] = {
+            "zen_mcp_connected": workflow.phase1_5_result.zen_mcp_connected,
+            "api_count": workflow.phase1_5_result.api_count,
+            "execution_mode": workflow.phase1_5_result.execution_mode
+        }
     
     # Phase 3 대기 상태 추가
     if hasattr(workflow, 'waiting_for_answer'):
